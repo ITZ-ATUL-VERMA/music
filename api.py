@@ -276,7 +276,8 @@ def request_premium():
 # ADMIN MANAGEMENT ENDPOINTS (ADD/EDIT/DELETE DBs & GMAILs)
 # =====================================================================
 def check_admin(req):
-    secret = req.headers.get("X-Admin-Secret") or (req.json or {}).get("admin_secret") or req.args.get("admin_secret")
+    json_data = req.get_json(silent=True) or {}
+    secret = req.headers.get("X-Admin-Secret") or json_data.get("admin_secret") or req.args.get("admin_secret")
     return secret == ADMIN_SECRET
 
 @app.route("/api/admin/dashboard", methods=["GET"])
