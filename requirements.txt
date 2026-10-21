@@ -1,0 +1,7 @@
+flet==0.25.2
+yt-dlp[default]
+Flask
+pymongo
+dnspython
+gunicorn
+python-dotenv
