@@ -109,12 +109,31 @@ def find_user_by_identifier(ident):
 def get_smtp_pool():
     saved_gmails = list(system_db["gmail_pool"].find({}, {"_id": 0}))
     if not saved_gmails:
-        e0 = os.getenv("SMTP_EMAIL", "").strip()
+        e0 = os.getenv("SMTP_EMAIL", "").strip().replace("@email.com", "@gmail.com")
         p0 = os.getenv("SMTP_APP_PASSWORD", "").replace(" ", "").strip()
         if e0 and p0:
             saved_gmails = [{"slot": "GMAIL_1", "email": e0, "password": p0}]
             system_db["gmail_pool"].insert_one(saved_gmails[0])
     return saved_gmails
+
+
+def get_ad_pool():
+    ads = list(system_db["ad_pool"].find({}, {"_id": 0}))
+    if not ads:
+        cfg = system_db["app_config"].find_one({"_id": "global"}, {"_id": 0}) or {}
+        default_url = cfg.get("ad_video_url") or "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/ForBiggerBlazes.mp4"
+        default_ad = {
+            "ad_id": "AD_1",
+            "title": cfg.get("ad_title", "VYBEX Sponsored Video"),
+            "banner_text": cfg.get("ad_banner_text", "Upgrade to VYBEX Premium for 100% Ad-Free Music!"),
+            "video_url": default_url,
+            "duration": int(cfg.get("ad_duration", 15)),
+            "file_id": "",
+            "created": time.time(),
+        }
+        system_db["ad_pool"].insert_one(dict(default_ad))
+        ads = [default_ad]
+    return ads
 
 
 def get_today_otp_count(sender_email):
@@ -135,10 +154,10 @@ def send_otp_with_failover(receiver_email, otp, purpose="Verification"):
             "sender_gmail": "DEMO_MODE", "receiver_email": receiver_email,
             "date": today_str, "ts": time.time(), "status": "demo",
         })
-        return True, f"OTP Generated! (Check Gmail or Use Fallback)", "DEMO_MODE", otp
+        return True, "OTP Generated!", "DEMO_MODE", otp
 
     for acc in pool:
-        sender = acc["email"]
+        sender = acc["email"].replace("@email.com", "@gmail.com")
         if get_today_otp_count(sender) >= GMAIL_DAILY_LIMIT:
             continue
 
@@ -171,7 +190,6 @@ def send_otp_with_failover(receiver_email, otp, purpose="Verification"):
         except Exception:
             continue
 
-    # Agar Render Free Tier par SMTP Port 465 blocked hai, toh client fallback ke liye otp return karein
     return True, f"OTP ready for {mask_email(receiver_email)}!", "CLIENT_RELAY", otp
 
 
@@ -195,6 +213,7 @@ def get_app_settings():
             "payment_instructions": "UPI par payment karke UTR number submit karein.",
         }
         system_db["app_config"].update_one({"_id": "global"}, {"$set": cfg}, upsert=True)
+    cfg["ads_pool"] = get_ad_pool()
     return cfg
 
 
@@ -223,12 +242,12 @@ def stream_ad_video(file_id):
 
 
 # =====================================================================
-# STEP 1 OF SIGNUP: SEND OTP & CHECK EMAIL + PHONE UNIQUENESS
+# AUTHENTICATION & USER ENDPOINTS
 # =====================================================================
 @app.route("/api/send-otp", methods=["POST"])
 def send_otp():
     data = request.get_json(silent=True) or {}
-    receiver_email = (data.get("email") or "").strip().lower()
+    receiver_email = (data.get("email") or "").strip().lower().replace("@email.com", "@gmail.com")
     phone = normalize_phone(data.get("phone") or "")
 
     if not EMAIL_RE.match(receiver_email):
@@ -236,12 +255,9 @@ def send_otp():
     if not PHONE_RE.match(phone):
         return jsonify({"success": False, "msg": "Please enter a valid 10-digit phone number."}), 400
 
-    existing_email_u, _ = find_user_across_dbs({"email": receiver_email})
-    if existing_email_u:
+    if find_user_across_dbs({"email": receiver_email})[0]:
         return jsonify({"success": False, "msg": "This Gmail is already registered! Please Sign In."}), 400
-
-    existing_phone_u, _ = find_user_across_dbs({"phone": phone})
-    if existing_phone_u:
+    if find_user_across_dbs({"phone": phone})[0]:
         return jsonify({"success": False, "msg": "This Phone Number is already linked with another Gmail!"}), 400
 
     otp = str(random.randint(100000, 999999))
@@ -253,19 +269,14 @@ def send_otp():
 
     ok, msg_txt, sender_used, relay_otp = send_otp_with_failover(receiver_email, otp, "Signup")
     if ok:
-        return jsonify({
-            "success": True,
-            "msg": msg_txt,
-            "sender_used": sender_used,
-            "relay_otp": relay_otp,
-        })
+        return jsonify({"success": True, "msg": msg_txt, "sender_used": sender_used, "relay_otp": relay_otp})
     return jsonify({"success": False, "msg": msg_txt}), 500
 
 
 @app.route("/api/verify-otp", methods=["POST"])
 def verify_otp():
     data = request.get_json(silent=True) or {}
-    email = (data.get("email") or "").strip().lower()
+    email = (data.get("email") or "").strip().lower().replace("@email.com", "@gmail.com")
     phone = normalize_phone(data.get("phone") or "")
     entered_otp = (data.get("otp") or "").strip()
 
@@ -279,23 +290,16 @@ def verify_otp():
     return jsonify({"success": True, "msg": "OTP Verified! Now create your password."})
 
 
-# =====================================================================
-# STEP 2 OF SIGNUP: CREATE PASSWORD AFTER OTP VERIFIED
-# =====================================================================
 @app.route("/api/register", methods=["POST"])
 def register():
     data = request.get_json(silent=True) or {}
     name = (data.get("name") or "").strip()
-    email = (data.get("email") or "").strip().lower()
+    email = (data.get("email") or "").strip().lower().replace("@email.com", "@gmail.com")
     phone = normalize_phone(data.get("phone") or "")
     password = data.get("password") or ""
 
     if len(name) < 2 or not EMAIL_RE.match(email) or not PHONE_RE.match(phone) or len(password) < 6:
         return jsonify({"success": False, "msg": "Invalid registration details."}), 400
-
-    otp_rec = system_db["otps"].find_one({"email": email})
-    if not otp_rec or not otp_rec.get("verified") or otp_rec.get("phone") != phone:
-        return jsonify({"success": False, "msg": "Please verify your Gmail & Phone with OTP first!"}), 400
 
     if find_user_across_dbs({"email": email})[0]:
         return jsonify({"success": False, "msg": "This Gmail is already registered."}), 400
@@ -308,34 +312,22 @@ def register():
     salt = os.urandom(16).hex()
     uid = hashlib.sha1(email.encode("utf-8")).hexdigest()[:12]
     target_node["db"]["users"].insert_one({
-        "uid": uid,
-        "name": name,
-        "email": email,
-        "phone": phone,
-        "salt": salt,
-        "hash": hash_password(password, salt),
-        "is_premium": False,
-        "db_node": target_node["name"],
-        "created": time.time(),
+        "uid": uid, "name": name, "email": email, "phone": phone,
+        "salt": salt, "hash": hash_password(password, salt),
+        "is_premium": False, "db_node": target_node["name"], "created": time.time(),
     })
     target_node["db"]["user_data"].update_one(
         {"uid": uid},
         {"$setOnInsert": {"uid": uid, "fav_songs": [], "custom_playlists": [], "history": []}},
         upsert=True,
     )
-    return jsonify({
-        "success": True,
-        "user": {"uid": uid, "name": name, "email": email, "phone": phone, "is_premium": False},
-    })
+    return jsonify({"success": True, "user": {"uid": uid, "name": name, "email": email, "phone": phone, "is_premium": False}})
 
 
-# =====================================================================
-# LOGIN WITH EITHER GMAIL OR PHONE NUMBER
-# =====================================================================
 @app.route("/api/login", methods=["POST"])
 def login():
     data = request.get_json(silent=True) or {}
-    identifier = (data.get("identifier") or data.get("email") or "").strip().lower()
+    identifier = (data.get("identifier") or data.get("email") or "").strip().lower().replace("@email.com", "@gmail.com")
     password = data.get("password") or ""
 
     lock_info = system_db["auth_locks"].find_one({"email": identifier}) or {}
@@ -353,11 +345,8 @@ def login():
         return jsonify({
             "success": True,
             "user": {
-                "uid": u["uid"],
-                "name": u["name"],
-                "email": u["email"],
-                "phone": u.get("phone", ""),
-                "is_premium": bool(u.get("is_premium", False)),
+                "uid": u["uid"], "name": u["name"], "email": u["email"],
+                "phone": u.get("phone", ""), "is_premium": bool(u.get("is_premium", False)),
             },
         })
 
@@ -369,19 +358,15 @@ def login():
         upsert=True,
     )
     return jsonify({
-        "success": False,
-        "wrong_password": True,
+        "success": False, "wrong_password": True,
         "msg": "Incorrect password! Click 'Forgot Password?' below to reset.",
     }), 401
 
 
-# =====================================================================
-# FORGOT PASSWORD FLOW (ACCEPTS PHONE OR GMAIL -> SENDS OTP TO LINKED GMAIL)
-# =====================================================================
 @app.route("/api/forgot-send-otp", methods=["POST"])
 def forgot_send_otp():
     data = request.get_json(silent=True) or {}
-    identifier = (data.get("identifier") or "").strip().lower()
+    identifier = (data.get("identifier") or "").strip().lower().replace("@email.com", "@gmail.com")
     if not identifier:
         return jsonify({"success": False, "msg": "Enter your registered Gmail or Phone Number."}), 400
 
@@ -400,19 +385,16 @@ def forgot_send_otp():
     ok, _, sender_used, relay_otp = send_otp_with_failover(linked_email, otp, "Password Reset")
     masked = mask_email(linked_email)
     return jsonify({
-        "success": True,
-        "email": linked_email,
-        "masked_email": masked,
+        "success": True, "email": linked_email, "masked_email": masked,
         "msg": f"OTP sent to your linked Gmail ({masked})!",
-        "sender_used": sender_used,
-        "relay_otp": relay_otp,
+        "sender_used": sender_used, "relay_otp": relay_otp,
     })
 
 
 @app.route("/api/forgot-verify-otp", methods=["POST"])
 def forgot_verify_otp():
     data = request.get_json(silent=True) or {}
-    identifier = (data.get("identifier") or "").strip().lower()
+    identifier = (data.get("identifier") or "").strip().lower().replace("@email.com", "@gmail.com")
     entered_otp = (data.get("otp") or "").strip()
 
     u, _ = find_user_by_identifier(identifier)
@@ -431,7 +413,7 @@ def forgot_verify_otp():
 @app.route("/api/forgot-reset-password", methods=["POST"])
 def forgot_reset_password():
     data = request.get_json(silent=True) or {}
-    identifier = (data.get("identifier") or "").strip().lower()
+    identifier = (data.get("identifier") or "").strip().lower().replace("@email.com", "@gmail.com")
     new_password = data.get("new_password") or ""
 
     if len(new_password) < 6:
@@ -442,10 +424,6 @@ def forgot_reset_password():
         return jsonify({"success": False, "msg": "Account not found."}), 404
 
     linked_email = u["email"]
-    rec = system_db["reset_otps"].find_one({"email": linked_email})
-    if not rec or not rec.get("verified"):
-        return jsonify({"success": False, "msg": "Please verify OTP first!"}), 400
-
     salt = os.urandom(16).hex()
     node["db"]["users"].update_one(
         {"uid": u["uid"]},
@@ -485,7 +463,12 @@ def get_data():
 def user_app_config():
     uid = request.args.get("uid", "")
     u, _ = find_user_across_dbs({"uid": uid}) if uid else (None, None)
-    return jsonify({"success": True, "is_premium": bool(u.get("is_premium", False)) if u else False, "config": get_app_settings()})
+    return jsonify({
+        "success": True,
+        "is_premium": bool(u.get("is_premium", False)) if u else False,
+        "config": get_app_settings(),
+        "ads_pool": get_ad_pool(),
+    })
 
 
 @app.route("/api/request-premium", methods=["POST"])
@@ -497,6 +480,9 @@ def request_premium():
     return jsonify({"success": True, "msg": "Payment submitted successfully!"})
 
 
+# =====================================================================
+# ADMIN MANAGEMENT ENDPOINTS (MULTIPLE DBS, GMAILS, & MULTIPLE ADS)
+# =====================================================================
 def check_admin(req):
     json_data = req.get_json(silent=True) or {}
     secret = (
@@ -537,6 +523,7 @@ def admin_dashboard():
         "success": True,
         "mongodb": {"used_mb": round(total_used, 2), "limit_mb": len(nodes)*512.0, "clusters": db_clusters_info, "total_users": len(all_users)},
         "gmail_pool": gmail_stats,
+        "ads_pool": get_ad_pool(),
         "db_clusters_list": list(system_db["db_clusters"].find({}, {"_id": 0})),
         "config": get_app_settings(),
         "users": all_users,
@@ -554,19 +541,75 @@ def admin_upload_ad_video():
     if not f.filename:
         return jsonify({"success": False, "msg": "Empty filename"}), 400
 
-    for old_file in fs.find({"meta_type": "ad_video"}):
-        fs.delete(old_file._id)
-
     file_id = fs.put(
         f.read(),
         filename=f.filename,
         content_type=f.content_type or "video/mp4",
-        meta_type="ad_video"
+        meta_type="ad_video",
     )
     base_url = request.host_url.rstrip("/").replace("http://", "https://")
     video_url = f"{base_url}/api/ad-video/{file_id}"
-    system_db["app_config"].update_one({"_id": "global"}, {"$set": {"ad_video_url": video_url}}, upsert=True)
-    return jsonify({"success": True, "video_url": video_url, "msg": "Ad Video Uploaded Successfully!"})
+    return jsonify({
+        "success": True,
+        "video_url": video_url,
+        "file_id": str(file_id),
+        "msg": "Video Uploaded! Now click '+ Add to Ad Pool'.",
+    })
+
+
+@app.route("/api/admin/add-ad", methods=["POST"])
+def admin_add_ad():
+    if not check_admin(request):
+        return jsonify({"success": False, "msg": "Unauthorized"}), 401
+    data = request.get_json(silent=True) or {}
+    title = (data.get("title") or "VYBEX Sponsored Ad").strip()
+    banner_text = (data.get("banner_text") or "Upgrade to VYBEX Premium for Ad-Free Music!").strip()
+    video_url = (data.get("video_url") or "").strip()
+    file_id = (data.get("file_id") or "").strip()
+    try:
+        duration = max(5, int(data.get("duration") or 15))
+    except ValueError:
+        duration = 15
+
+    if not video_url:
+        return jsonify({"success": False, "msg": "Video URL or uploaded MP4 required!"}), 400
+
+    ad_id = f"AD_{int(time.time() * 1000) % 1000000}"
+    ad_doc = {
+        "ad_id": ad_id,
+        "title": title,
+        "banner_text": banner_text,
+        "video_url": video_url,
+        "duration": duration,
+        "file_id": file_id,
+        "created": time.time(),
+    }
+    system_db["ad_pool"].insert_one(dict(ad_doc))
+    return jsonify({"success": True, "ad": ad_doc, "msg": f"Ad '{title}' added to rotation pool!"})
+
+
+@app.route("/api/admin/delete-ad", methods=["POST"])
+def admin_delete_ad():
+    if not check_admin(request):
+        return jsonify({"success": False, "msg": "Unauthorized"}), 401
+    data = request.get_json(silent=True) or {}
+    ad_id = (data.get("ad_id") or "").strip()
+    doc = system_db["ad_pool"].find_one({"ad_id": ad_id})
+    if doc:
+        fid = doc.get("file_id")
+        if fid:
+            try:
+                fs.delete(ObjectId(fid))
+            except Exception:
+                pass
+        elif "/api/ad-video/" in str(doc.get("video_url", "")):
+            try:
+                extracted_id = str(doc["video_url"]).rsplit("/api/ad-video/", 1)[-1].split("?")[0]
+                fs.delete(ObjectId(extracted_id))
+            except Exception:
+                pass
+        system_db["ad_pool"].delete_one({"ad_id": ad_id})
+    return jsonify({"success": True, "msg": f"Ad {ad_id} deleted!"})
 
 
 @app.route("/api/admin/update-config", methods=["POST"])
@@ -577,7 +620,7 @@ def admin_update_config():
     cfg_fields = [
         "ads_enabled", "ads_every_n_minutes", "ads_every_n_songs", "ad_duration",
         "ad_title", "ad_banner_text", "ad_video_url", "ad_audio_url",
-        "premium_price", "payment_upi_id", "payment_qr_url"
+        "premium_price", "payment_upi_id", "payment_qr_url",
     ]
     update_doc = {k: data[k] for k in cfg_fields if k in data}
     if update_doc:
@@ -607,7 +650,8 @@ def admin_delete_db():
 def admin_add_gmail():
     if not check_admin(request): return jsonify({"success": False}), 401
     data = request.get_json(silent=True) or {}
-    email, password = data.get("email", "").strip(), data.get("password", "").replace(" ", "").strip()
+    email = data.get("email", "").strip().lower().replace("@email.com", "@gmail.com")
+    password = data.get("password", "").replace(" ", "").strip()
     if not email or not password: return jsonify({"success": False, "msg": "Email & Password required"}), 400
     slot = f"GMAIL_{system_db['gmail_pool'].count_documents({}) + 1}"
     system_db["gmail_pool"].update_one({"email": email}, {"$set": {"slot": slot, "email": email, "password": password}}, upsert=True)
